@@ -139,6 +139,15 @@ ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio,
                                      __android_log_pmsg_file_read_fn fn,
                                      void* arg);
 
+/* Read exactly "ramoops" or "pstore_blk", without fallback. Returns bytes read,
+ * zero for no matching records, or negative errno. Open/read failures discard
+ * collected fragments before invoking callbacks. This does not pin an inode
+ * before open. Callers must serialize pmsg reads: the existing reader retains
+ * static preread state. */
+ssize_t __android_log_pmsg_file_read_from_backend(const char* backend, log_id_t logId, char prio,
+                                                 const char* prefix,
+                                                 __android_log_pmsg_file_read_fn fn, void* arg);
+
 int __android_log_security_bwrite(int32_t tag, const void* payload, size_t len);
 int __android_log_security_bswrite(int32_t tag, const char* payload);
 int __android_log_security(); /* Device Owner is present */

@@ -31,11 +31,23 @@
 #include "uio.h"
 
 static std::atomic<int> pmsg_fd;
+static std::atomic<int64_t> pmsg_retry_at;
 
 static void GetPmsgFd() {
-  // Note if open() fails and returns -1, that value is stored into pmsg_fd as an indication that
-  // pmsg is not available and open() should not be retried.
+  // Cache permanent errors, but allow a pstore backend loaded later to create pmsg0.
   if (pmsg_fd != 0) {
+    return;
+  }
+
+  // Bound open attempts on devices without pmsg, including concurrent writers.
+  timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    return;
+  }
+  const int64_t now_ns = static_cast<int64_t>(now.tv_sec) * NS_PER_SEC + now.tv_nsec;
+  int64_t retry_at = pmsg_retry_at.load();
+  if (now_ns < retry_at ||
+      !pmsg_retry_at.compare_exchange_strong(retry_at, now_ns + NS_PER_SEC)) {
     return;
   }
 
@@ -45,7 +57,13 @@ static void GetPmsgFd() {
   // STDIN_FILENO != stdin, so we call open() to get a new fd value in this case.
   if (new_fd == 0) {
     new_fd = TEMP_FAILURE_RETRY(open("/dev/pmsg0", O_WRONLY | O_CLOEXEC));
+    int open_errno = errno;
     close(0);
+    errno = open_errno;
+  }
+
+  if (new_fd < 0 && errno == ENOENT) {
+    return;
   }
 
   // pmsg_fd should only be opened once.  If we see that pmsg_fd is uninitialized, we open
@@ -66,6 +84,7 @@ void PmsgClose() {
     close(pmsg_fd);
   }
   pmsg_fd = 0;
+  pmsg_retry_at = 0;
 }
 
 int PmsgWrite(log_id_t logId, const struct timespec* ts, const struct iovec* vec, size_t nr,

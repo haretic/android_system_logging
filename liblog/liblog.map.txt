@@ -88,6 +88,7 @@ LIBLOG_37 { # introduced=37
 LIBLOG_PRIVATE {
   global:
     __android_log_pmsg_file_read;
+    __android_log_pmsg_file_read_from_backend;
     __android_log_pmsg_file_write;
     android_openEventTagMap;
     android_log_processBinaryLogBuffer;

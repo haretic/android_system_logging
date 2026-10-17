@@ -28,7 +28,8 @@
 
 #include "logger.h"
 
-int PmsgRead(struct logger_list* logger_list, struct log_msg* log_msg) {
+static int PmsgReadFromPath(struct logger_list* logger_list, struct log_msg* log_msg,
+                            const char* selected_path) {
   ssize_t ret;
   off_t current, next;
   struct __attribute__((__packed__)) {
@@ -41,14 +42,22 @@ int PmsgRead(struct logger_list* logger_list, struct log_msg* log_msg) {
   memset(log_msg, 0, sizeof(*log_msg));
 
   if (logger_list->fd.load() <= 0) {
-    int i, fd = open("/sys/fs/pstore/pmsg-ramoops-0", O_RDONLY | O_CLOEXEC);
+    // Keep one backend for this reader; do not merge unrelated boot histories.
+    const char* path = selected_path ? selected_path : "/sys/fs/pstore/pmsg-ramoops-0";
+    int i, fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (!selected_path && fd < 0 && errno == ENOENT) {
+      path = "/sys/fs/pstore/pmsg-pstore_blk-0";
+      fd = open(path, O_RDONLY | O_CLOEXEC);
+    }
 
     if (fd < 0) {
       return -errno;
     }
     if (fd == 0) { /* Argggg */
-      fd = open("/sys/fs/pstore/pmsg-ramoops-0", O_RDONLY | O_CLOEXEC);
+      fd = open(path, O_RDONLY | O_CLOEXEC);
+      int open_errno = errno;
       close(0);
+      errno = open_errno;
       if (fd < 0) {
         return -errno;
       }
@@ -75,7 +84,9 @@ int PmsgRead(struct logger_list* logger_list, struct log_msg* log_msg) {
       preread_count += ret;
     }
     if (preread_count != sizeof(buf)) {
-      return preread_count ? -EIO : -EAGAIN;
+      // Keep the legacy EOF convention; an explicit read must distinguish
+      // clean EOF from an EAGAIN returned by read().
+      return preread_count ? -EIO : (selected_path ? 0 : -EAGAIN);
     }
     if ((buf.p.magic != LOGGER_MAGIC) || (buf.p.len <= sizeof(buf)) ||
         (buf.p.len > (sizeof(buf) + LOGGER_ENTRY_MAX_PAYLOAD)) ||
@@ -127,6 +138,20 @@ int PmsgRead(struct logger_list* logger_list, struct log_msg* log_msg) {
     if (fd <= 0) {
       return -EBADF;
     }
+    if (selected_path) {
+      // A seek can succeed past EOF. Validate filtered payloads too before
+      // allowing the explicit file API to publish any collected fragments.
+      size_t remaining = buf.p.len - sizeof(buf);
+      char ignored[256];
+      while (remaining) {
+        size_t count = remaining < sizeof(ignored) ? remaining : sizeof(ignored);
+        ret = TEMP_FAILURE_RETRY(read(fd, ignored, count));
+        if (ret < 0) return -errno;
+        if (ret == 0) return -EIO;
+        remaining -= ret;
+      }
+      continue;
+    }
     current = TEMP_FAILURE_RETRY(lseek(fd, (off_t)0, SEEK_CUR));
     if (current < 0) {
       return -errno;
@@ -145,6 +170,10 @@ int PmsgRead(struct logger_list* logger_list, struct log_msg* log_msg) {
   }
 }
 
+int PmsgRead(struct logger_list* logger_list, struct log_msg* log_msg) {
+  return PmsgReadFromPath(logger_list, log_msg, nullptr);
+}
+
 void PmsgClose(struct logger_list* logger_list) {
   int fd = logger_list->fd.exchange(0);
   if (fd > 0) {
@@ -160,8 +189,8 @@ static void* realloc_or_free(void* ptr, size_t new_size) {
   return result;
 }
 
-ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio, const char* prefix,
-                                     __android_log_pmsg_file_read_fn fn, void* arg) {
+static ssize_t ReadPmsgFiles(const char* selected_path, log_id_t logId, char prio,
+                             const char* prefix, __android_log_pmsg_file_read_fn fn, void* arg) {
   ssize_t ret;
   struct content {
     struct listnode node;
@@ -214,7 +243,8 @@ ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio, const char* pref
 
   /* Read the file content */
   log_msg log_msg;
-  while (PmsgRead(&logger_list, &log_msg) > 0) {
+  int read_result;
+  while ((read_result = PmsgReadFromPath(&logger_list, &log_msg, selected_path)) > 0) {
     const char* cp;
     size_t hdr_size = log_msg.entry.hdr_size;
 
@@ -374,6 +404,12 @@ ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio, const char* pref
   }
   PmsgClose(&logger_list);
 
+  // The explicit-backend API reports open/read errors and emits no partial
+  // files on failure. Keep the existing automatic API behavior unchanged.
+  const bool read_failed = selected_path &&
+      (read_result < 0 || ret == -ENOMEM);
+  if (read_failed && ret != -ENOMEM) ret = read_result;
+
   /* Progress through all the collected files */
   list_for_each_safe(node, n, &name_list) {
     struct listnode *content_node, *m;
@@ -391,6 +427,11 @@ ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio, const char* pref
       ssize_t add_len;
 
       content = node_to_item(content_node, struct content, node);
+      if (read_failed) {
+        list_remove(content_node);
+        free(content);
+        continue;
+      }
       add_len = content->entry.len - tag_len - sizeof(prio);
       if (add_len <= 0) {
         list_remove(content_node);
@@ -464,5 +505,25 @@ ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio, const char* pref
     list_remove(node);
     free(names);
   }
-  return (ret == SSIZE_MAX) ? -ENOENT : ret;
+  return (ret == SSIZE_MAX) ? (selected_path ? 0 : -ENOENT) : ret;
+}
+
+ssize_t __android_log_pmsg_file_read(log_id_t logId, char prio, const char* prefix,
+                                    __android_log_pmsg_file_read_fn fn, void* arg) {
+  return ReadPmsgFiles(nullptr, logId, prio, prefix, fn, arg);
+}
+
+ssize_t __android_log_pmsg_file_read_from_backend(const char* backend, log_id_t logId, char prio,
+                                                 const char* prefix,
+                                                 __android_log_pmsg_file_read_fn fn, void* arg) {
+  if (!backend) return -EINVAL;
+  const char* path;
+  if (!strcmp(backend, "ramoops")) {
+    path = "/sys/fs/pstore/pmsg-ramoops-0";
+  } else if (!strcmp(backend, "pstore_blk")) {
+    path = "/sys/fs/pstore/pmsg-pstore_blk-0";
+  } else {
+    return -EINVAL;
+  }
+  return ReadPmsgFiles(path, logId, prio, prefix, fn, arg);
 }
